@@ -3,3 +3,5 @@ flask-socketio
 python-socketio
 eventlet
 gunicorn
+streamlit
+streamlit-autorefresh
