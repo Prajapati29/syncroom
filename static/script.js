@@ -12,14 +12,20 @@ firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
 
 function onYouTubeIframeAPIReady() {
     player = new YT.Player('player', {
-        height: '100%',
-        width: '100%',
-        playerVars: { 'playsinline': 1, 'controls': 1, 'disablekb': 1 },
-        events: {
-            'onReady': onPlayerReady,
-            'onStateChange': onPlayerStateChange
-        }
-    });
+            height: '100%',
+            width: '100%',
+            // NEW CODE: We added the 'origin' line below
+            playerVars: { 
+                'playsinline': 1, 
+                'controls': 1, 
+                'disablekb': 0,
+                'origin': window.location.origin 
+            },
+            events: {
+                'onReady': onPlayerReady,
+                'onStateChange': onPlayerStateChange
+            }
+        });
 }
 
 function onPlayerReady(event) {
