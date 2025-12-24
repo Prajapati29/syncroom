@@ -2,3 +2,4 @@ Flask
 flask-socketio
 python-socketio
 eventlet
+gunicorn
