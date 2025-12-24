@@ -107,6 +107,16 @@ st.markdown("""
         border-radius: 5px 5px 0 0;
         padding: 10px 16px;
     }
+    
+    /* YouTube player container - prevent flashing */
+    .youtube-player {
+        transition: opacity 0.3s ease;
+    }
+    
+    /* Hide Streamlit's refresh spinner */
+    .stSpinner > div > div {
+        display: none !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -128,7 +138,8 @@ class RoomManager:
                 'pause_time': None,
                 'total_pause_duration': 0,
                 'room_creator': None,
-                'created_at': time.time()
+                'created_at': time.time(),
+                'last_video_change': 0
             }
             self.users[room_name] = set()
             self.room_activity[room_name] = time.time()
@@ -187,6 +198,7 @@ class RoomManager:
         if room['current_video'] is None:
             video_data['start_time'] = time.time()
             room['current_video'] = video_data
+            room['last_video_change'] = time.time()
             message = "Started playing"
         else:
             room['queue'].append(video_data)
@@ -232,6 +244,7 @@ class RoomManager:
             room['paused'] = False
             room['pause_time'] = None
             room['total_pause_duration'] = 0
+            room['last_video_change'] = time.time()
             
             self.room_activity[room_name] = time.time()
             if username:
@@ -239,6 +252,7 @@ class RoomManager:
             return True
         else:
             room['current_video'] = None
+            room['last_video_change'] = time.time()
             if username:
                 self.add_msg(room_name, "System", f"⏹️ {username} stopped playback")
             return False
@@ -355,7 +369,22 @@ def get_video_info(video_id):
 # --- 3. INITIALIZE MANAGER ---
 manager = RoomManager()
 
-# --- 4. SIDEBAR: ROOM SELECTION & LOGIN ---
+# --- 4. SESSION STATE INITIALIZATION ---
+# Initialize session state for user
+if 'username' not in st.session_state:
+    st.session_state.username = ""
+if 'current_room' not in st.session_state:
+    st.session_state.current_room = ""
+if 'joined' not in st.session_state:
+    st.session_state.joined = False
+if 'last_video_id' not in st.session_state:
+    st.session_state.last_video_id = None
+if 'last_sync_time' not in st.session_state:
+    st.session_state.last_sync_time = 0
+if 'auto_refresh_interval' not in st.session_state:
+    st.session_state.auto_refresh_interval = 3000  # Start with 3 seconds
+
+# --- 5. SIDEBAR: ROOM SELECTION & LOGIN ---
 with st.sidebar:
     # Custom header with logo
     st.markdown("""
@@ -366,14 +395,6 @@ with st.sidebar:
     """, unsafe_allow_html=True)
     
     st.divider()
-    
-    # Initialize session state for user
-    if 'username' not in st.session_state:
-        st.session_state.username = ""
-    if 'current_room' not in st.session_state:
-        st.session_state.current_room = ""
-    if 'joined' not in st.session_state:
-        st.session_state.joined = False
     
     # Room selection section
     st.subheader("🏠 Select Room")
@@ -425,6 +446,7 @@ with st.sidebar:
             manager.remove_user(room_name, st.session_state.username)
             st.session_state.joined = False
             st.session_state.username = ""
+            st.session_state.last_video_id = None
             st.success("Left the room")
             st.rerun()
     
@@ -451,11 +473,12 @@ with st.sidebar:
     if st.session_state.joined and room_name in manager.users:
         st.subheader("📊 Room Stats")
         
+        room_data = manager.get_room(room_name)
+        
         col1, col2 = st.columns(2)
         with col1:
             st.metric("👥 Users", len(manager.users[room_name]))
         with col2:
-            room_data = manager.get_room(room_name)
             st.metric("🎵 Queue", len(room_data['queue']))
         
         # Active users list
@@ -470,6 +493,32 @@ with st.sidebar:
         if room_data.get('room_creator'):
             created_time = datetime.fromtimestamp(room_data['created_at']).strftime("%H:%M")
             st.caption(f"Created by {room_data['room_creator']} at {created_time}")
+    
+    st.divider()
+    
+    # Auto-refresh control
+    st.subheader("⚙️ Settings")
+    
+    # Let user control refresh rate
+    refresh_rate = st.select_slider(
+        "Auto-refresh rate",
+        options=["Slow (5s)", "Normal (3s)", "Fast (2s)", "Realtime (1s)"],
+        value="Normal (3s)",
+        help="Controls how often the page updates. Faster = more responsive but may cause flashing."
+    )
+    
+    # Map selection to milliseconds
+    refresh_map = {
+        "Slow (5s)": 5000,
+        "Normal (3s)": 3000,
+        "Fast (2s)": 2000,
+        "Realtime (1s)": 1000
+    }
+    
+    st.session_state.auto_refresh_interval = refresh_map[refresh_rate]
+    
+    if st.button("🔄 Manual Refresh", use_container_width=True):
+        st.rerun()
     
     st.divider()
     
@@ -489,15 +538,7 @@ with st.sidebar:
         • Chat updates in real-time
         """)
 
-# --- 5. AUTO-REFRESH SETUP ---
-# Clean up inactive rooms periodically
-if 'last_cleanup' not in st.session_state or time.time() - st.session_state.last_cleanup > 300:  # Every 5 minutes
-    cleaned = manager.cleanup_inactive_rooms()
-    st.session_state.last_cleanup = time.time()
-
-# Determine refresh interval based on activity
-refresh_interval = 2000  # Default: 2 seconds
-
+# --- 6. CHECK USER JOIN STATUS ---
 # Check if user has joined
 if not st.session_state.joined:
     # Show welcome screen
@@ -506,9 +547,9 @@ if not st.session_state.joined:
     
     col_welcome1, col_welcome2, col_welcome3 = st.columns([1, 2, 1])
     with col_welcome2:
-        st.image("https://cdn-icons-png.flaticon.com/512/1384/1384060.png", width=150)
         st.markdown("""
-        <div style="text-align: center;">
+        <div style="text-align: center; padding: 40px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 15px;">
+            <h1 style="font-size: 64px; margin: 0;">🎬</h1>
             <h3>👈 Start by joining a room</h3>
             <p>Select a room from the sidebar or create a new one!</p>
         </div>
@@ -528,21 +569,46 @@ if not st.session_state.joined:
     
     st.stop()
 
-# User is joined, continue with main app
+# --- 7. MAIN APP LOGIC ---
 username = st.session_state.username
 room_name = st.session_state.current_room
 room_data = manager.get_room(room_name)
 
-# Adjust refresh rate
-if room_data['current_video'] and not room_data['paused']:
-    refresh_interval = 1000  # 1 second when playing
+# Update auto-refresh interval based on whether video is playing
+current_video_id = room_data['current_video']['id'] if room_data['current_video'] else None
+
+# Only auto-refresh when needed (not when video is playing and nothing changed)
+should_refresh = True
+if current_video_id:
+    # Check if video changed since last render
+    if current_video_id == st.session_state.last_video_id:
+        # Same video, check if we need to update frequently
+        if not room_data['paused']:
+            # Video is playing, we need more frequent updates for time sync
+            should_refresh = True
+        else:
+            # Video is paused, less frequent updates
+            should_refresh = time.time() - st.session_state.last_sync_time > 5  # Only every 5 seconds when paused
+    else:
+        # Video changed, definitely refresh
+        should_refresh = True
+        st.session_state.last_video_id = current_video_id
+
+# Store current sync time
+st.session_state.last_sync_time = time.time()
+
+# Apply conditional auto-refresh
+if should_refresh:
+    count = st_autorefresh(
+        interval=st.session_state.auto_refresh_interval, 
+        key="autorefresh",
+        limit=100000
+    )
 else:
-    refresh_interval = 3000  # 3 seconds when idle
+    # Create a placeholder to prevent errors
+    st_autorefresh(interval=30000, key="slow_refresh", limit=100000)
 
-# Apply auto-refresh
-count = st_autorefresh(interval=refresh_interval, key="autorefresh", limit=100000)
-
-# --- 6. MAIN APP INTERFACE ---
+# --- 8. MAIN APP INTERFACE ---
 # Header
 st.markdown(f"""
 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
@@ -553,7 +619,7 @@ st.markdown(f"""
         </p>
     </div>
     <div style="text-align: right;">
-        <small>🔄 Refreshing every {refresh_interval//1000}s</small>
+        <small>🔄 Refreshing every {st.session_state.auto_refresh_interval//1000}s</small>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -593,19 +659,60 @@ with col1:
             with col_time:
                 st.markdown(f"**⏱️ {elapsed_str}**")
         
-        # Video player embed
-        video_url = f"https://www.youtube.com/embed/{current['id']}?start={elapsed}&controls=1&modestbranding=1&rel=0"
-        st.components.v1.html(f"""
-        <div style="border-radius: 10px; overflow: hidden; margin: 10px 0; box-shadow: 0 10px 30px rgba(0,0,0,0.3);">
-            <iframe width="100%" height="450" 
-                src="{video_url}" 
-                frameborder="0" 
-                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" 
-                allowfullscreen
-                style="display: block;">
-            </iframe>
-        </div>
-        """, height=470)
+        # VIDEO PLAYER - THE KEY FIX: Only update when video changes
+        # Store current video state to detect changes
+        video_state_key = f"video_{current['id']}_{elapsed}"
+        
+        # Use st.empty() to create a placeholder that we can update selectively
+        video_placeholder = st.empty()
+        
+        # Only update the iframe when necessary (video changed or significant time jump)
+        if 'last_video_state' not in st.session_state or st.session_state.last_video_state != video_state_key:
+            # Build YouTube embed URL with enhanced parameters for stability
+            video_url = f"https://www.youtube.com/embed/{current['id']}?start={elapsed}&autoplay=1&controls=1&modestbranding=1&rel=0&enablejsapi=1"
+            
+            # Create a more stable YouTube embed with error handling
+            youtube_embed = f"""
+            <div class="youtube-player" id="ytplayer-{current['id']}">
+                <iframe 
+                    width="100%" 
+                    height="450" 
+                    src="{video_url}" 
+                    frameborder="0" 
+                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" 
+                    allowfullscreen
+                    style="border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,0.3);">
+                </iframe>
+                <script>
+                    // Keep the iframe alive even during page updates
+                    try {{
+                        var iframe = document.getElementById('ytplayer-{current['id']}').querySelector('iframe');
+                        if (iframe) {{
+                            // Store reference to keep it alive
+                            window.currentYouTubePlayer = iframe;
+                        }}
+                    }} catch(e) {{}}
+                </script>
+            </div>
+            """
+            
+            # Only update the player when needed
+            with video_placeholder.container():
+                st.components.v1.html(youtube_embed, height=470)
+            
+            # Store current video state
+            st.session_state.last_video_state = video_state_key
+        else:
+            # Video hasn't changed, just show a placeholder to maintain layout
+            with video_placeholder.container():
+                # Minimal update - just the elapsed time
+                st.markdown(f"""
+                <div style="text-align: center; padding: 20px; background: #1e1e1e; border-radius: 10px; margin: 10px 0;">
+                    <p>Video playing: {current['title'][:30]}...</p>
+                    <p>Time: {elapsed_str}</p>
+                    <small>Player is active and synced</small>
+                </div>
+                """, unsafe_allow_html=True)
         
         # Playback controls
         st.markdown("### 🎛️ Controls")
@@ -613,23 +720,32 @@ with col1:
         with control_cols[0]:
             if st.button("⏭️ Skip", use_container_width=True, help="Skip to next song"):
                 manager.skip(room_name, username)
+                st.session_state.last_video_state = None  # Force player update
                 st.rerun()
         with control_cols[1]:
             pause_text = "▶️ Resume" if room_data['paused'] else "⏸️ Pause"
             if st.button(pause_text, use_container_width=True, help="Pause/Resume playback"):
                 manager.toggle_pause(room_name, username)
+                st.session_state.last_video_state = None  # Force player update
                 st.rerun()
         with control_cols[2]:
-            if st.button("🔄 Refresh", use_container_width=True, help="Refresh player"):
+            if st.button("🔄 Sync Now", use_container_width=True, help="Force time sync"):
+                st.session_state.last_video_state = None  # Force player update
                 st.rerun()
         with control_cols[3]:
-            if st.button("🗑️ Clear", use_container_width=True, help="Stop playback and clear current"):
+            if st.button("🗑️ Clear", use_container_width=True, help="Stop playback"):
                 if room_data['current_video']:
                     room_data['current_video'] = None
+                    room_data['last_video_change'] = time.time()
+                    st.session_state.last_video_state = None
                     st.rerun()
         
     else:
         # No video playing
+        # Clear video state
+        if 'last_video_state' in st.session_state:
+            st.session_state.last_video_state = None
+        
         st.markdown("### 🎵 No video playing")
         st.markdown("""
         <div style="
@@ -677,6 +793,7 @@ with col1:
                             # Add to queue first, then skip
                             manager.skip(room_name, username)
                         st.success(message)
+                        st.session_state.last_video_state = None  # Force player update
                         time.sleep(0.3)
                         st.rerun()
                     else:
@@ -690,22 +807,25 @@ with col1:
         
         # Popular music examples
         quick_links = {
-            "Lo-fi Radio": "https://www.youtube.com/watch?v=jfKfPfyJRdk",
-            "Jazz Vibes": "https://www.youtube.com/watch?v=WqMvI2qrX_c",
-            "Synthwave": "https://www.youtube.com/watch?v=4xDzrJKXOOY"
+            "Lo-fi Radio": "jfKfPfyJRdk",
+            "Jazz Vibes": "WqMvI2qrX_c",
+            "Synthwave": "4xDzrJKXOOY"
         }
         
         with col_q1:
             if st.button("🎧 Lo-fi", use_container_width=True):
                 manager.add_video(room_name, quick_links["Lo-fi Radio"], username)
+                st.session_state.last_video_state = None
                 st.rerun()
         with col_q2:
             if st.button("🎷 Jazz", use_container_width=True):
                 manager.add_video(room_name, quick_links["Jazz Vibes"], username)
+                st.session_state.last_video_state = None
                 st.rerun()
         with col_q3:
             if st.button("🌃 Synthwave", use_container_width=True):
                 manager.add_video(room_name, quick_links["Synthwave"], username)
+                st.session_state.last_video_state = None
                 st.rerun()
 
 # --- RIGHT COLUMN: CHAT & QUEUE ---
@@ -817,19 +937,10 @@ with footer_cols[0]:
 with footer_cols[1]:
     st.caption(f"User: **{username}**")
 with footer_cols[2]:
-    st.caption("SyncRoom v2.0 • Made with Streamlit")
+    st.caption("SyncRoom v2.1 • Stable Video Player")
 
-# Add some debug info in expander (hidden by default)
-with st.expander("🔧 Debug Info"):
-    if st.checkbox("Show room data"):
-        st.json(room_data)
-    
-    if st.checkbox("Show all rooms"):
-        st.write("Active rooms:", manager.list_rooms())
-        for room in manager.list_rooms():
-            st.write(f"- {room}: {len(manager.users.get(room, []))} users")
-    
-    if st.button("Force cleanup"):
-        cleaned = manager.cleanup_inactive_rooms(60)  # Clean rooms inactive for 1 minute
-        st.write(f"Cleaned {cleaned} rooms")
-        st.rerun()
+# --- CLEANUP ---
+# Clean up inactive rooms periodically
+if 'last_cleanup' not in st.session_state or time.time() - st.session_state.last_cleanup > 300:  # Every 5 minutes
+    cleaned = manager.cleanup_inactive_rooms()
+    st.session_state.last_cleanup = time.time()
