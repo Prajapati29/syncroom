@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SyncRoom Pro</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+</head>
+<body>
+
+    <div class="bg-gradient"></div>
+
+    <div id="login-screen">
+        <div class="glass-card login-card">
+            <div class="logo">
+                <i class="fa-solid fa-music"></i> SyncRoom
+            </div>
+            <p>Listen together in real-time.</p>
+            
+            <div class="input-group">
+                <i class="fa-solid fa-user"></i>
+                <input type="text" id="username" placeholder="Your Nickname">
+            </div>
+            
+            <div class="input-group">
+                <i class="fa-solid fa-door-open"></i>
+                <input type="text" id="room-input" placeholder="Room Name (e.g. vibe)">
+            </div>
+
+            <button class="btn-primary" onclick="joinRoom()">
+                Enter Room <i class="fa-solid fa-arrow-right"></i>
+            </button>
+        </div>
+    </div>
+
+    <div id="app-screen" class="hidden">
+        
+        <nav class="glass-nav">
+            <div class="nav-left">
+                <h2 id="room-display"><i class="fa-solid fa-hashtag"></i> Room</h2>
+            </div>
+            <div class="nav-right">
+                <button class="btn-icon" onclick="copyLink()" title="Copy Link">
+                    <i class="fa-solid fa-link"></i>
+                </button>
+                <button class="btn-danger" onclick="leaveRoom()" title="Leave">
+                    <i class="fa-solid fa-power-off"></i>
+                </button>
+            </div>
+        </nav>
+
+        <div class="main-container">
+            
+            <section class="theater-section">
+                <div class="video-container glass-panel">
+                    <div id="player"></div> 
+                </div>
+
+                <div class="controls-bar glass-panel">
+                    <div class="song-info">
+                        <span class="pulse-icon"><i class="fa-solid fa-circle-play"></i></span>
+                        <h3 id="current-song">Waiting for music...</h3>
+                    </div>
+                    
+                    <div class="actions">
+                        <button class="btn-action" onclick="skipSong()">
+                            <i class="fa-solid fa-forward-step"></i> Skip Vote
+                        </button>
+                    </div>
+                </div>
+
+                <div class="add-song-bar glass-panel">
+                    <i class="fa-brands fa-youtube"></i>
+                    <input type="text" id="youtube-url" placeholder="Paste YouTube Link here...">
+                    <button class="btn-add" onclick="addSong()">
+                        <i class="fa-solid fa-plus"></i> Add
+                    </button>
+                </div>
+            </section>
+
+            <section class="social-section glass-panel">
+                
+                <div class="tabs">
+                    <button class="tab active" onclick="switchTab('chat')">Chat</button>
+                    <button class="tab" onclick="switchTab('queue')">Queue</button>
+                </div>
+
+                <div id="chat-panel" class="panel-content">
+                    <div id="chat-box">
+                        </div>
+                    <div class="chat-input-area">
+                        <input type="text" id="msg-input" placeholder="Type a message..." onkeypress="handleChat(event)">
+                        <button onclick="sendChatManual()"><i class="fa-solid fa-paper-plane"></i></button>
+                    </div>
+                </div>
+
+                <div id="queue-panel" class="panel-content hidden-panel">
+                    <ul id="queue-list">
+                        </ul>
+                </div>
+
+            </section>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+    
+    <script>
+        function switchTab(tab) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.panel-content').forEach(p => p.classList.add('hidden-panel'));
+            
+            if(tab === 'chat') {
+                document.querySelector('.tabs button:nth-child(1)').classList.add('active');
+                document.getElementById('chat-panel').classList.remove('hidden-panel');
+            } else {
+                document.querySelector('.tabs button:nth-child(2)').classList.add('active');
+                document.getElementById('queue-panel').classList.remove('hidden-panel');
+            }
+        }
+        
+        function sendChatManual() {
+            const input = document.getElementById('msg-input');
+            // Trigger the existing logic manually
+            const e = { key: 'Enter' };
+            handleChat(e);
+        }
+    </script>
+</body>
+</html>
