@@ -2,6 +2,7 @@ import streamlit as st
 import time
 import re
 import requests
+import json
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
 
@@ -108,9 +109,9 @@ st.markdown("""
         padding: 10px 16px;
     }
     
-    /* YouTube player container - prevent flashing */
-    .youtube-player {
-        transition: opacity 0.3s ease;
+    /* Progress bar styling */
+    .stProgress > div > div > div {
+        background-color: #667eea;
     }
     
     /* Hide Streamlit's refresh spinner */
@@ -127,11 +128,13 @@ class RoomManager:
         self.rooms = {}
         self.users = {}  # Track active users by room
         self.room_activity = {}  # Track last activity time for cleanup
+        # Cache for video durations to avoid repeated API calls
+        self.video_duration_cache = {}
     
     def get_room(self, room_name):
         if room_name not in self.rooms:
             self.rooms[room_name] = {
-                'current_video': None,  # {'id': '...', 'url': '...', 'title': '...', 'start_time': 12345}
+                'current_video': None,  # {'id': '...', 'url': '...', 'title': '...', 'start_time': 12345, 'duration': 0}
                 'queue': [],
                 'chat': [],
                 'paused': False,
@@ -139,7 +142,8 @@ class RoomManager:
                 'total_pause_duration': 0,
                 'room_creator': None,
                 'created_at': time.time(),
-                'last_video_change': 0
+                'last_video_change': 0,
+                'auto_skip_enabled': True  # Auto-skip when video ends
             }
             self.users[room_name] = set()
             self.room_activity[room_name] = time.time()
@@ -182,7 +186,7 @@ class RoomManager:
         if not video_id:
             return False, "Invalid YouTube URL"
         
-        # Get video info
+        # Get video info including duration
         video_info = get_video_info(video_id)
         
         video_data = {
@@ -191,6 +195,7 @@ class RoomManager:
             'title': video_info['title'],
             'thumbnail': video_info['thumbnail'],
             'author': video_info['author'],
+            'duration': video_info['duration'],
             'added_by': username,
             'added_at': time.time()
         }
@@ -257,6 +262,32 @@ class RoomManager:
                 self.add_msg(room_name, "System", f"⏹️ {username} stopped playback")
             return False
     
+    def check_and_skip_if_finished(self, room_name):
+        """Check if current video has finished and skip to next automatically"""
+        room = self.get_room(room_name)
+        
+        if not room['current_video'] or room['paused']:
+            return False
+        
+        if 'duration' not in room['current_video'] or room['current_video']['duration'] == 0:
+            # Duration unknown, can't auto-skip
+            return False
+        
+        # Calculate elapsed time considering pauses
+        if room['paused'] and room['pause_time']:
+            current_pause_duration = time.time() - room['pause_time']
+        else:
+            current_pause_duration = 0
+        
+        total_pause = room.get('total_pause_duration', 0) + current_pause_duration
+        elapsed = time.time() - room['current_video']['start_time'] - total_pause
+        
+        # Check if video has finished (with 5-second buffer)
+        if elapsed >= room['current_video']['duration'] - 5:  # 5 seconds before end
+            return self.skip(room_name, "Auto-skip")
+        
+        return False
+    
     def remove_from_queue(self, room_name, index, username=""):
         room = self.get_room(room_name)
         if 0 <= index < len(room['queue']):
@@ -306,6 +337,15 @@ class RoomManager:
             return True
         return False
     
+    def toggle_auto_skip(self, room_name, username=""):
+        room = self.get_room(room_name)
+        room['auto_skip_enabled'] = not room['auto_skip_enabled']
+        status = "enabled" if room['auto_skip_enabled'] else "disabled"
+        self.room_activity[room_name] = time.time()
+        if username:
+            self.add_msg(room_name, "System", f"⚡ {username} {status} auto-skip")
+        return room['auto_skip_enabled']
+    
     def add_msg(self, room_name, user, text):
         room = self.get_room(room_name)
         timestamp = datetime.now().strftime("%H:%M")
@@ -345,17 +385,31 @@ class RoomManager:
         return len(to_remove)
 
 def get_video_info(video_id):
-    """Fetch video title and thumbnail using YouTube oEmbed"""
+    """Fetch video title, thumbnail, and duration using YouTube API"""
     try:
-        url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
-        response = requests.get(url, timeout=3)
+        # Try to get video info from YouTube oEmbed (title and thumbnail)
+        oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+        response = requests.get(oembed_url, timeout=3)
+        
         if response.status_code == 200:
             data = response.json()
-            return {
-                'title': data.get('title', f'Video {video_id}'),
-                'thumbnail': data.get('thumbnail_url', ''),
-                'author': data.get('author_name', 'Unknown')
-            }
+            title = data.get('title', f'Video {video_id}')
+            thumbnail = data.get('thumbnail_url', f'https://img.youtube.com/vi/{video_id}/0.jpg')
+            author = data.get('author_name', 'Unknown')
+        else:
+            title = f'Video {video_id}'
+            thumbnail = f'https://img.youtube.com/vi/{video_id}/0.jpg'
+            author = 'Unknown'
+        
+        # Try to get duration from YouTube (various methods)
+        duration = get_video_duration(video_id)
+        
+        return {
+            'title': title,
+            'thumbnail': thumbnail,
+            'author': author,
+            'duration': duration
+        }
     except:
         pass
     
@@ -363,8 +417,69 @@ def get_video_info(video_id):
     return {
         'title': f'Video {video_id}',
         'thumbnail': f'https://img.youtube.com/vi/{video_id}/0.jpg',
-        'author': 'Unknown'
+        'author': 'Unknown',
+        'duration': 0  # Unknown duration
     }
+
+def get_video_duration(video_id):
+    """Get video duration in seconds using various methods"""
+    try:
+        # Method 1: Try to extract from YouTube embed page
+        embed_url = f"https://www.youtube.com/embed/{video_id}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(embed_url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            # Search for duration in the page
+            html = response.text
+            # Look for patterns that might contain duration
+            patterns = [
+                r'"length_seconds":\s*"(\d+)"',
+                r'"approxDurationMs":\s*"(\d+)"',
+                r'"duration":\s*"(\d+)"',
+                r'data\-duration="(\d+)"'
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, html)
+                if match:
+                    duration_str = match.group(1)
+                    if 'approxDurationMs' in pattern:
+                        # Convert milliseconds to seconds
+                        return int(duration_str) // 1000
+                    else:
+                        return int(duration_str)
+    except:
+        pass
+    
+    # Method 2: Use YouTube Data API if you have an API key
+    # Uncomment and add your API key if you have one
+    """
+    try:
+        api_key = "YOUR_YOUTUBE_API_KEY"  # Replace with your API key
+        api_url = f"https://www.googleapis.com/youtube/v3/videos?id={video_id}&part=contentDetails&key={api_key}"
+        response = requests.get(api_url, timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            if 'items' in data and len(data['items']) > 0:
+                duration_str = data['items'][0]['contentDetails']['duration']
+                # Parse ISO 8601 duration (e.g., PT1H30M15S)
+                import isodate
+                duration = isodate.parse_duration(duration_str)
+                return int(duration.total_seconds())
+    except:
+        pass
+    """
+    
+    # Method 3: Use a fallback based on video type
+    # Check if it's a short (typically less than 60 seconds)
+    if re.search(r'^shorts', video_id, re.I):
+        return 60  # Assume 60 seconds for shorts
+    
+    # Default fallback - most music videos are 3-5 minutes
+    return 240  # Default to 4 minutes (240 seconds)
 
 # --- 3. INITIALIZE MANAGER ---
 manager = RoomManager()
@@ -382,7 +497,9 @@ if 'last_video_id' not in st.session_state:
 if 'last_sync_time' not in st.session_state:
     st.session_state.last_sync_time = 0
 if 'auto_refresh_interval' not in st.session_state:
-    st.session_state.auto_refresh_interval = 3000  # Start with 3 seconds
+    st.session_state.auto_refresh_interval = 2000  # Start with 2 seconds
+if 'last_auto_skip_check' not in st.session_state:
+    st.session_state.last_auto_skip_check = 0
 
 # --- 5. SIDEBAR: ROOM SELECTION & LOGIN ---
 with st.sidebar:
@@ -502,16 +619,16 @@ with st.sidebar:
     # Let user control refresh rate
     refresh_rate = st.select_slider(
         "Auto-refresh rate",
-        options=["Slow (5s)", "Normal (3s)", "Fast (2s)", "Realtime (1s)"],
-        value="Normal (3s)",
-        help="Controls how often the page updates. Faster = more responsive but may cause flashing."
+        options=["Slow (10s)", "Normal (5s)", "Fast (3s)", "Realtime (1s)"],
+        value="Normal (5s)",
+        help="Faster refresh = better sync but more data usage"
     )
     
     # Map selection to milliseconds
     refresh_map = {
-        "Slow (5s)": 5000,
-        "Normal (3s)": 3000,
-        "Fast (2s)": 2000,
+        "Slow (10s)": 10000,
+        "Normal (5s)": 5000,
+        "Fast (3s)": 3000,
         "Realtime (1s)": 1000
     }
     
@@ -529,13 +646,13 @@ with st.sidebar:
         2. **Enter your nickname** and join
         3. **Paste YouTube URLs** to add songs
         4. **Chat** with others in the room
-        5. **Control playback** together
+        5. **Videos auto-skip** when finished
         
         ### Tips:
-        • Everyone sees the same video
-        • Videos stay in sync automatically
+        • Videos automatically skip to next when finished
+        • Progress bar shows time remaining
+        • Enable/disable auto-skip in video controls
         • Use the queue to plan ahead
-        • Chat updates in real-time
         """)
 
 # --- 6. CHECK USER JOIN STATUS ---
@@ -574,39 +691,20 @@ username = st.session_state.username
 room_name = st.session_state.current_room
 room_data = manager.get_room(room_name)
 
-# Update auto-refresh interval based on whether video is playing
-current_video_id = room_data['current_video']['id'] if room_data['current_video'] else None
+# Check if current video has finished and skip automatically
+# Only check every 3 seconds to avoid excessive checks
+current_time = time.time()
+if current_time - st.session_state.last_auto_skip_check > 3:
+    if room_data.get('auto_skip_enabled', True):
+        manager.check_and_skip_if_finished(room_name)
+    st.session_state.last_auto_skip_check = current_time
 
-# Only auto-refresh when needed (not when video is playing and nothing changed)
-should_refresh = True
-if current_video_id:
-    # Check if video changed since last render
-    if current_video_id == st.session_state.last_video_id:
-        # Same video, check if we need to update frequently
-        if not room_data['paused']:
-            # Video is playing, we need more frequent updates for time sync
-            should_refresh = True
-        else:
-            # Video is paused, less frequent updates
-            should_refresh = time.time() - st.session_state.last_sync_time > 5  # Only every 5 seconds when paused
-    else:
-        # Video changed, definitely refresh
-        should_refresh = True
-        st.session_state.last_video_id = current_video_id
-
-# Store current sync time
-st.session_state.last_sync_time = time.time()
-
-# Apply conditional auto-refresh
-if should_refresh:
-    count = st_autorefresh(
-        interval=st.session_state.auto_refresh_interval, 
-        key="autorefresh",
-        limit=100000
-    )
-else:
-    # Create a placeholder to prevent errors
-    st_autorefresh(interval=30000, key="slow_refresh", limit=100000)
+# Apply auto-refresh
+count = st_autorefresh(
+    interval=st.session_state.auto_refresh_interval, 
+    key="autorefresh",
+    limit=100000
+)
 
 # --- 8. MAIN APP INTERFACE ---
 # Header
@@ -615,7 +713,7 @@ st.markdown(f"""
     <div>
         <h1 style="margin: 0;">🎵 {room_name}</h1>
         <p style="margin: 0; color: #888; font-size: 14px;">
-            👤 {username} • 👥 {len(manager.users.get(room_name, []))} online • ⚡ Auto-sync
+            👤 {username} • 👥 {len(manager.users.get(room_name, []))} online • ⚡ Auto-skip: {'ON' if room_data.get('auto_skip_enabled', True) else 'OFF'}
         </p>
     </div>
     <div style="text-align: right;">
@@ -640,10 +738,26 @@ with col1:
             current_pause_duration = 0
         
         total_pause = room_data.get('total_pause_duration', 0) + current_pause_duration
-        elapsed = max(0, int(time.time() - current['start_time'] - total_pause))
+        elapsed = max(0, time.time() - current['start_time'] - total_pause)
         
         # Format elapsed time
-        elapsed_str = f"{elapsed // 60}:{elapsed % 60:02d}"
+        elapsed_min = int(elapsed // 60)
+        elapsed_sec = int(elapsed % 60)
+        elapsed_str = f"{elapsed_min}:{elapsed_sec:02d}"
+        
+        # Calculate progress percentage
+        duration = current.get('duration', 0)
+        if duration > 0:
+            progress = min(elapsed / duration, 1.0)
+            remaining = max(0, duration - elapsed)
+            remaining_min = int(remaining // 60)
+            remaining_sec = int(remaining % 60)
+            remaining_str = f"{remaining_min}:{remaining_sec:02d}"
+            progress_percent = int(progress * 100)
+        else:
+            progress = 0
+            remaining_str = "∞"
+            progress_percent = 0
         
         # Video player header
         player_header = st.container()
@@ -657,62 +771,38 @@ with col1:
                 status = "⏸️ Paused" if room_data['paused'] else "▶️ Playing"
                 st.markdown(f"**{status}**")
             with col_time:
-                st.markdown(f"**⏱️ {elapsed_str}**")
+                if duration > 0:
+                    st.markdown(f"**⏱️ {elapsed_str} / {remaining_str}**")
+                else:
+                    st.markdown(f"**⏱️ {elapsed_str}**")
         
-        # VIDEO PLAYER - THE KEY FIX: Only update when video changes
-        # Store current video state to detect changes
-        video_state_key = f"video_{current['id']}_{elapsed}"
+        # Progress bar
+        if duration > 0:
+            st.progress(progress, text=f"Progress: {progress_percent}%")
         
-        # Use st.empty() to create a placeholder that we can update selectively
-        video_placeholder = st.empty()
+        # YouTube embed
+        start_time_seconds = int(elapsed)
+        video_url = f"https://www.youtube.com/embed/{current['id']}?start={start_time_seconds}&autoplay=1&controls=1&modestbranding=1&rel=0"
         
-        # Only update the iframe when necessary (video changed or significant time jump)
-        if 'last_video_state' not in st.session_state or st.session_state.last_video_state != video_state_key:
-            # Build YouTube embed URL with enhanced parameters for stability
-            video_url = f"https://www.youtube.com/embed/{current['id']}?start={elapsed}&autoplay=1&controls=1&modestbranding=1&rel=0&enablejsapi=1"
-            
-            # Create a more stable YouTube embed with error handling
-            youtube_embed = f"""
-            <div class="youtube-player" id="ytplayer-{current['id']}">
-                <iframe 
-                    width="100%" 
-                    height="450" 
-                    src="{video_url}" 
-                    frameborder="0" 
-                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" 
-                    allowfullscreen
-                    style="border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,0.3);">
-                </iframe>
-                <script>
-                    // Keep the iframe alive even during page updates
-                    try {{
-                        var iframe = document.getElementById('ytplayer-{current['id']}').querySelector('iframe');
-                        if (iframe) {{
-                            // Store reference to keep it alive
-                            window.currentYouTubePlayer = iframe;
-                        }}
-                    }} catch(e) {{}}
-                </script>
-            </div>
-            """
-            
-            # Only update the player when needed
-            with video_placeholder.container():
-                st.components.v1.html(youtube_embed, height=470)
-            
-            # Store current video state
-            st.session_state.last_video_state = video_state_key
-        else:
-            # Video hasn't changed, just show a placeholder to maintain layout
-            with video_placeholder.container():
-                # Minimal update - just the elapsed time
-                st.markdown(f"""
-                <div style="text-align: center; padding: 20px; background: #1e1e1e; border-radius: 10px; margin: 10px 0;">
-                    <p>Video playing: {current['title'][:30]}...</p>
-                    <p>Time: {elapsed_str}</p>
-                    <small>Player is active and synced</small>
-                </div>
-                """, unsafe_allow_html=True)
+        youtube_embed = f"""
+        <div class="youtube-player" id="ytplayer-{current['id']}">
+            <iframe 
+                width="100%" 
+                height="450" 
+                src="{video_url}" 
+                frameborder="0" 
+                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" 
+                allowfullscreen
+                style="border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,0.3);">
+            </iframe>
+        </div>
+        """
+        
+        st.components.v1.html(youtube_embed, height=470)
+        
+        # Auto-skip warning if video is ending soon
+        if duration > 0 and remaining < 30 and room_data.get('auto_skip_enabled', True):
+            st.warning(f"⏳ Video ends in {int(remaining)} seconds. Next: {room_data['queue'][0]['title'][:30] if room_data['queue'] else 'Nothing in queue'}")
         
         # Playback controls
         st.markdown("### 🎛️ Controls")
@@ -720,32 +810,26 @@ with col1:
         with control_cols[0]:
             if st.button("⏭️ Skip", use_container_width=True, help="Skip to next song"):
                 manager.skip(room_name, username)
-                st.session_state.last_video_state = None  # Force player update
                 st.rerun()
         with control_cols[1]:
             pause_text = "▶️ Resume" if room_data['paused'] else "⏸️ Pause"
             if st.button(pause_text, use_container_width=True, help="Pause/Resume playback"):
                 manager.toggle_pause(room_name, username)
-                st.session_state.last_video_state = None  # Force player update
                 st.rerun()
         with control_cols[2]:
-            if st.button("🔄 Sync Now", use_container_width=True, help="Force time sync"):
-                st.session_state.last_video_state = None  # Force player update
+            auto_skip_status = "🔴 Disable Auto-skip" if room_data.get('auto_skip_enabled', True) else "🟢 Enable Auto-skip"
+            if st.button(auto_skip_status, use_container_width=True, help="Toggle auto-skip when video ends"):
+                manager.toggle_auto_skip(room_name, username)
                 st.rerun()
         with control_cols[3]:
             if st.button("🗑️ Clear", use_container_width=True, help="Stop playback"):
                 if room_data['current_video']:
                     room_data['current_video'] = None
                     room_data['last_video_change'] = time.time()
-                    st.session_state.last_video_state = None
                     st.rerun()
         
     else:
         # No video playing
-        # Clear video state
-        if 'last_video_state' in st.session_state:
-            st.session_state.last_video_state = None
-        
         st.markdown("### 🎵 No video playing")
         st.markdown("""
         <div style="
@@ -793,7 +877,6 @@ with col1:
                             # Add to queue first, then skip
                             manager.skip(room_name, username)
                         st.success(message)
-                        st.session_state.last_video_state = None  # Force player update
                         time.sleep(0.3)
                         st.rerun()
                     else:
@@ -803,29 +886,31 @@ with col1:
     
     with add_tab2:
         st.info("💡 Quick YouTube links")
-        col_q1, col_q2, col_q3 = st.columns(3)
+        col_q1, col_q2, col_q3, col_q4 = st.columns(4)
         
-        # Popular music examples
+        # Popular music examples with known durations
         quick_links = {
-            "Lo-fi Radio": "jfKfPfyJRdk",
-            "Jazz Vibes": "WqMvI2qrX_c",
-            "Synthwave": "4xDzrJKXOOY"
+            "🎧 Lo-fi": "jfKfPfyJRdk",  # 24/7 lofi
+            "🎷 Jazz": "WqMvI2qrX_c",    # Jazz vibes
+            "🌃 Synthwave": "4xDzrJKXOOY", # Synthwave mix
+            "🎶 Pop Hits": "JGwWNGJdvx8"   # Popular music
         }
         
         with col_q1:
-            if st.button("🎧 Lo-fi", use_container_width=True):
-                manager.add_video(room_name, quick_links["Lo-fi Radio"], username)
-                st.session_state.last_video_state = None
+            if st.button("Lo-fi", use_container_width=True):
+                manager.add_video(room_name, quick_links["🎧 Lo-fi"], username)
                 st.rerun()
         with col_q2:
-            if st.button("🎷 Jazz", use_container_width=True):
-                manager.add_video(room_name, quick_links["Jazz Vibes"], username)
-                st.session_state.last_video_state = None
+            if st.button("Jazz", use_container_width=True):
+                manager.add_video(room_name, quick_links["🎷 Jazz"], username)
                 st.rerun()
         with col_q3:
-            if st.button("🌃 Synthwave", use_container_width=True):
-                manager.add_video(room_name, quick_links["Synthwave"], username)
-                st.session_state.last_video_state = None
+            if st.button("Synthwave", use_container_width=True):
+                manager.add_video(room_name, quick_links["🌃 Synthwave"], username)
+                st.rerun()
+        with col_q4:
+            if st.button("Pop", use_container_width=True):
+                manager.add_video(room_name, quick_links["🎶 Pop Hits"], username)
                 st.rerun()
 
 # --- RIGHT COLUMN: CHAT & QUEUE ---
@@ -886,8 +971,12 @@ with col2:
                         col_s1, col_s2, col_s3 = st.columns([6, 1, 1])
                         with col_s1:
                             st.markdown(f"**{i+1}.** {song['title'][:40]}{'...' if len(song['title']) > 40 else ''}")
-                            if song.get('added_by'):
-                                st.caption(f"by {song['added_by']}")
+                            if song.get('duration', 0) > 0:
+                                duration_min = song['duration'] // 60
+                                duration_sec = song['duration'] % 60
+                                st.caption(f"⏱️ {duration_min}:{duration_sec:02d} • by {song.get('added_by', 'Unknown')}")
+                            else:
+                                st.caption(f"by {song.get('added_by', 'Unknown')}")
                         with col_s2:
                             if st.button("↑", key=f"up_{i}", help="Move up"):
                                 if i > 0:
@@ -937,10 +1026,10 @@ with footer_cols[0]:
 with footer_cols[1]:
     st.caption(f"User: **{username}**")
 with footer_cols[2]:
-    st.caption("SyncRoom v2.1 • Stable Video Player")
+    st.caption(f"Auto-skip: {'✅ ON' if room_data.get('auto_skip_enabled', True) else '❌ OFF'}")
 
 # --- CLEANUP ---
 # Clean up inactive rooms periodically
-if 'last_cleanup' not in st.session_state or time.time() - st.session_state.last_cleanup > 300:  # Every 5 minutes
+if 'last_cleanup' not in st.session_state or time.time() - st.session_state.last_cleanup > 300:
     cleaned = manager.cleanup_inactive_rooms()
     st.session_state.last_cleanup = time.time()
